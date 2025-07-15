@@ -1,25 +1,26 @@
 from guardrails import Guard, OnFailAction
 from validator import CheckCompetitorMentions  # <-- make sure this points to your class file
 import os
+from opentelemetry import metrics
+
+# Disable metrics by setting a no-op meter provider
+metrics.set_meter_provider(metrics.NoOpMeterProvider())
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # Define competitor list (from your config)
 competitors = [
     "Sastatickets",
+    "Booking.com",
     "easytickets",
     "bookkaru",
     "checkin",
     "ticketwala",
-    "booking",
     "ticket pak",
     "ticket price",
     "online ticket",
     "travelone",
     "pakwheels",
-    "pakistan railways",
-    "GoPakistanTravel",
-    "Pakistan Railways",
-    "Pakistan Travels"
+    "GoPakistanTravel"
 ]
 
 # Guard setup

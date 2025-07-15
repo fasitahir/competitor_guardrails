@@ -1,28 +1,37 @@
-import os
-import dotenv
+import streamlit as st
 import requests
+import dotenv
+import os
 import litellm
 
-# Load environment variables
+# --- Load environment variables ---
 dotenv.load_dotenv()
-
-# Get Together.ai API key
 together_api_key = os.getenv("TOGETHER_API_KEY")
 if not together_api_key:
-    raise ValueError("TOGETHER_API_KEY not found in .env file. Get it from https://www.together.ai")
+    st.error("TOGETHER_API_KEY not found. Please check your .env file.")
+    st.stop()
 
 model = "together_ai/mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-# Set model alias map
+# --- Set model alias ---
 litellm.model_alias_map = {
-    "together-qwen": {
+    "together-qwen": 
+    {
         "model_name": model,
         "litellm_provider": "together_ai",
-        "api_key": together_api_key
-    }
+        "api_key": together_api_key 
+        }
 }
 
-# Function to call Together Qwen using LiteLLM
+# --- Streamlit page config ---
+st.set_page_config(page_title="Guardrails Chatbot", layout="wide")
+st.title("🛡️ Guardrails Chatbot (w/ Competitor Filter)")
+
+# --- Chat history ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- Define TogetherAI call ---
 def call_together_qwen(prompt, **kwargs):
     response = litellm.completion(
         model=model,
@@ -32,48 +41,49 @@ def call_together_qwen(prompt, **kwargs):
     )
     return response.choices[0].message.content
 
-# Main execution
-prompt = "Tell me about a platform where i can book tickets"
-
-try:
-    #Step 1: Send USER QUERY to Guardrails Server (query guard)
-    query_payload = {
+# --- Guardrails call ---
+def validate_guardrails(messages):
+    payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt.lower()}
-        ]
-    }
-    query_response = requests.post(
-        "http://localhost:8000/guards/competitor-guard/openai/v1/chat/completions",
-        headers={"Authorization": "Bearer dummy"},
-        json=query_payload
-    )
-    query_response.raise_for_status()
-    query_result = query_response.json()
-    print("Query Guard Passed")
-
-    # Step 2: Call Model
-    qwen_response = call_together_qwen(prompt, max_tokens=1000)
-    print("Qwen Response:", qwen_response)
-
-    #Step 3: Send MODEL RESPONSE to Guardrails Server (response guard)
-    response_payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt.lower()},
-            {"role": "assistant", "content": qwen_response.lower()}
-        ]
+        "messages": messages
     }
     response = requests.post(
         "http://localhost:8000/guards/competitor-guard/openai/v1/chat/completions",
         headers={"Authorization": "Bearer dummy"},
-        json=response_payload
+        json=payload
     )
     response.raise_for_status()
-    response_data = response.json()
-    print("Guardrails Server Response:", response_data)
+    return response.json()
 
-except requests.exceptions.RequestException as req_err:
-    print(f"❌ Request Error: {req_err}")
-except Exception as e:
-    print(f"❌ Blocked by Guard: {str(e)}")
+# --- User input ---
+user_input = st.chat_input("Say something...")
+if user_input:
+    # 1. Query Guard
+    try:
+        validate_guardrails([{"role": "user", "content": user_input.lower()}])
+        st.session_state.messages.append({"role": "user", "content": user_input})
+    except Exception as e:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.session_state.messages.append({"role": "assistant", "content": "🚫 Query blocked by Guardrails.\n" + str(e)})
+        user_input = None
+
+# 2. Model Response + Response Guard
+    if user_input:
+        try:
+            response = call_together_qwen(user_input)
+            # Validate model response
+            validate_guardrails([
+                {"role": "user", "content": user_input.lower()},
+                {"role": "assistant", "content": response.lower()}
+            ])
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        except Exception as e:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"🚫 Blocked by Guardrails after model response.\n{str(e)}"
+            })
+
+# --- Display messages ---
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
