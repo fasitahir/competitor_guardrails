@@ -1,16 +1,35 @@
+import json
 from typing import Optional, List
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import re
+from typing import Optional
 
 from guardrails.validators import Validator
 from guardrails.validators import register_validator
 from guardrails.validators import FailResult, PassResult
 
-import litellm  # <--- using this to call your LLM
-import os
+import litellm 
+
+import logging
+
+# Create named logger
+logger = logging.getLogger("validator")
+logger.setLevel(logging.INFO)  # Or DEBUG for more detail
+
+# Avoid adding multiple handlers
+if not logger.handlers:
+    file_handler = logging.FileHandler("validator.log", mode='a')  # Relative to project root
+    file_handler.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+
+logger.info("Logging initialized successfully.")
 
 # Init NER
 tokenizer = AutoTokenizer.from_pretrained("dslim/bert-base-NER")
@@ -65,28 +84,39 @@ class CheckCompetitorMentions(Validator):
                 matches.append(most_similar_competitor)
         return matches
 
-    def llm_detect_competitor(text: str, model_name: str = None) -> Optional[str]:
-        system_prompt = (
-            "Check whether the input text mentions any ticketing or booking companies other than Bookme.pk. "
-            "Return exactly 'None' if no competitors are detected. "
-            "If competitors are detected, return their names in lowercase, separated by commas, with no additional text. "
-            "Exclude Bookme.pk and its variations (e.g., 'bookme', 'book me'). "
-            "DO NOT include explanations, periods, or any other text. "
-            "Examples: 'None', 'easytickets,tripadvisor'"
-            "Example use cases: " \
-            "If user mentions 'bookme', return 'None'. " \
-            "If user mentions 'easytickets', return 'easytickets'. "
-            "If user mentions 'bookme and tripadvisor', return 'tripadvisor'. " \
-            "If user mentions 'bookme.pk and easytickets', return 'easytickets. "
-            'User enters '' returns None. ' \
-            "Do not return any other sentence or even word Just return the competitor names or 'None'. "
 
-        )
+    def llm_detect_competitor(self, text: str, model_name: str = None) -> Optional[str]:
+        if not text.strip():
+            logger.warning("Empty input received for LLM detection. Skipping.")
+            return None
+
+        system_prompt = """
+    You are a strict JSON-only filter that checks if the input mentions any competitors of Bookme.pk.
+
+    You MUST respond in the following exact format:
+    {
+    "competitors": ["competitor1", "competitor2"]
+    }
+
+    Rules:
+    - Always use lowercase for competitor names.
+    - If no competitor is mentioned, respond with: { "competitors": [] }
+    - NEVER include any explanation, greeting, or text outside the JSON block.
+    - You are Filter of Bookme only focus on competitors of bookme
+
+    Examples:
+    Input: "I used EasyTickets" → {"competitors": ["easytickets"]}
+    Input: "Bookme.pk is great" → {"competitors": []}
+    Input: "tripadvisor and bookme are good" → {"competitors": ["tripadvisor"]}
+    Input: "" → {"competitors": []}
+    """
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text}
         ]
+
+        logger.info(f"LLM detection input: {text}")
 
         try:
             result = litellm.completion(
@@ -96,41 +126,44 @@ class CheckCompetitorMentions(Validator):
                 temperature=0.0
             )
 
-            response = result.choices[0].message.content.strip().lower()
+            response = result.choices[0].message.content.strip()
+            logger.info(f"LLM raw response: {response}")
 
-            # Check if response starts with "none" or is empty
-            if response.startswith("none") or not response:
+            # Attempt to parse the JSON
+            try:
+                parsed = json.loads(response)
+                competitors = parsed.get("competitors", [])
+                if not isinstance(competitors, list):
+                    raise ValueError("Invalid format for 'competitors' field")
+            except Exception as parse_err:
+                logger.error(f"Failed to parse LLM response as JSON: {parse_err}")
                 return None
 
-            # Explicitly filter out Bookme-related terms
-            if any(term in response for term in {"bookme", "bookme.pk", "book me"}):
-                return None
-
-            # Split response into potential competitor names
-            competitors = [name.strip() for name in response.split(",") if name.strip()]
-            filtered_competitors = [
-                name for name in competitors 
-                if name and "bookme" not in name and name not in {"none", "no", "n/a", ""}
+            # Filter out bookme variants and empty values
+            filtered = [
+                c for c in competitors
+                if c and "bookme" not in c and c not in {"none", "n/a"}
             ]
 
-            # Return None if no valid competitors remain
-            if not filtered_competitors:
+            if not filtered:
                 return None
 
-            return ", ".join(filtered_competitors)
+            logger.info(f"LLM detected competitors: {filtered}")
+            return ", ".join(filtered)
 
         except Exception as e:
-            print(f"⚠️ LLM detection failed: {e}")
+            logger.error(f"LLM detection failed: {e}")
             return None
 
 
     def validate(self, value: str, metadata: Optional[dict[str, str]] = None):
         model_used = metadata.get("model") if metadata else None
-        print(f"🔍 Running validator. Model: {model_used or 'N/A'}")
+        print(f"Running validator. Model: {model_used or 'N/A'}")
 
         # Step 1: Exact matching
-        exact_matches = self.exact_match(value)
+        exact_matches = self.exact_match(value.lower())
         if exact_matches:
+            logger.info(f"Found exact matches: {exact_matches}")
             return FailResult(
                 error_message=f"Mentions competitors: {', '.join(exact_matches)}"
             )
@@ -140,15 +173,16 @@ class CheckCompetitorMentions(Validator):
         similarity_matches = self.vector_similarity_match(entities)
 
         if similarity_matches:
+            logger.info(f"Found similarity matches: {similarity_matches}")
             return FailResult(
                 error_message=f"Mentions competitors (via NER): {', '.join(similarity_matches)}"
             )
 
-        # #Step 3: LLM detection
-        # llm_result = self.llm_detect_competitor(value, model_name=model_used)
-        # if llm_result:
-        #     return FailResult(
-        #         error_message=f"LLM detected competitor mention: {llm_result}"
-        #     )
-
+        #Step 3: LLM detection
+        llm_result = self.llm_detect_competitor(text=value, model_name=model_used)
+        if llm_result:
+            logger.info(f"LLM detected competitors: {llm_result}")
+            return FailResult(
+                error_message=f"LLM detected competitor mention: {llm_result}"
+            )
         return PassResult()
